@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <Nullable>disable</Nullable>
+    <PackageId>JetDatabaseReader</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Diego Rípera</Authors>
+    <Company>Diego Rípera</Company>
+    <Description>Pure-managed reader for Microsoft Access JET databases (.mdb/.accdb). No OleDB, ODBC, or ACE drivers required.</Description>
+    <PackageTags>access;jet;mdb;accdb;database;microsoft-access</PackageTags>
+    <PackageProjectUrl>https://github.com/diegoripera/JetDatabaseReader</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/diegoripera/JetDatabaseReader</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>
