@@ -5,10 +5,6 @@ on:
     tags:
       - 'v*'
 
-defaults:
-  run:
-    working-directory: JetDatabaseReader
-
 jobs:
   publish:
     runs-on: windows-latest
@@ -21,18 +17,18 @@ jobs:
         uses: actions/setup-dotnet@v3
         with:
           dotnet-version: '8.0.x'
-      
+
       - name: Restore dependencies
-        run: dotnet restore JetDatabaseReader.csproj
+        run: dotnet restore ${{ github.workspace }}/JetDatabaseReader/JetDatabaseReader.csproj
 
       - name: Build
-        run: dotnet build JetDatabaseReader.csproj -c Release --no-restore
+        run: dotnet build ${{ github.workspace }}/JetDatabaseReader/JetDatabaseReader.csproj -c Release --no-restore
 
       - name: Create NuGet package
-        run: dotnet pack JetDatabaseReader.csproj -c Release --no-build -o ../nupkg
+        run: dotnet pack ${{ github.workspace }}/JetDatabaseReader/JetDatabaseReader.csproj -c Release --no-build -o ${{ github.workspace }}/nupkg
 
       - name: List files (debug)
-        run: dir ../nupkg
+        run: dir ${{ github.workspace }}\nupkg
 
       - name: Push to NuGet.org
-        run: dotnet nuget push ../nupkg/*.nupkg --api-key ${{secrets.NUGET_API_KEY}} --source https://api.nuget.org/v3/index.json --skip-duplicate
+        run: dotnet nuget push "${{ github.workspace }}\nupkg\*.nupkg" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
