@@ -4,6 +4,7 @@ using System.Data;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace JetDatabaseReader
@@ -98,8 +99,8 @@ namespace JetDatabaseReader
         private readonly int _codePage;
         private readonly object _cacheLock = new object();
         private readonly object _catalogLock = new object();
-        private List<CatalogEntry> _catalogCache;
-        private LruCache<long, byte[]> _pageCache;
+        private volatile List<CatalogEntry> _catalogCache;
+        private volatile LruCache<long, byte[]> _pageCache;
         private bool _disposed;
         private long _cacheHits;
         private long _cacheMisses;
@@ -253,6 +254,15 @@ namespace JetDatabaseReader
         {
             if (_fs.Length < 128)
                 throw new InvalidDataException("File too small to be a valid JET database");
+
+            // Verify the JET magic signature at offset 0: 00 01 00 00
+            _fs.Seek(0, SeekOrigin.Begin);
+            var magic = new byte[4];
+            int read = _fs.Read(magic, 0, 4);
+            if (read < 4 || magic[0] != 0x00 || magic[1] != 0x01 || magic[2] != 0x00 || magic[3] != 0x00)
+                throw new InvalidDataException(
+                    $"File does not have a valid JET magic signature " +
+                    $"(expected 00 01 00 00, got {magic[0]:X2} {magic[1]:X2} {magic[2]:X2} {magic[3]:X2}).");
         }
 
         public void Dispose()
@@ -300,7 +310,14 @@ namespace JetDatabaseReader
         {
             var buf = new byte[_pgSz];
             _fs.Seek(n * _pgSz, SeekOrigin.Begin);
-            _fs.Read(buf, 0, _pgSz);
+            // FileStream.Read is not guaranteed to return all bytes in one call
+            int read = 0;
+            while (read < _pgSz)
+            {
+                int got = _fs.Read(buf, read, _pgSz - read);
+                if (got == 0) break;
+                read += got;
+            }
             return buf;
         }
 
@@ -311,65 +328,27 @@ namespace JetDatabaseReader
 
             if (PageCacheSize < 0) return ReadPage(n);  // cache disabled
 
-            lock (_cacheLock)
-            {
-                if (_pageCache == null && PageCacheSize > 0)
-                    _pageCache = new LruCache<long, byte[]>(PageCacheSize);
-
-                if (_pageCache != null && _pageCache.TryGetValue(n, out byte[] cached))
-                {
-                    _cacheHits++;
-                    return cached;
-                }
-            }
-
-            _cacheMisses++;
-            byte[] page = ReadPage(n);
-
-            if (PageCacheSize > 0)
+            // Lazy-init: only one thread creates the cache; LruCache is internally thread-safe
+            // so subsequent TryGetValue/Add calls need no outer lock.
+            if (_pageCache == null && PageCacheSize > 0)
             {
                 lock (_cacheLock)
                 {
-                    _pageCache?.Add(n, page);
+                    if (_pageCache == null)
+                        _pageCache = new LruCache<long, byte[]>(PageCacheSize);
                 }
             }
 
+            if (_pageCache != null && _pageCache.TryGetValue(n, out byte[] cached))
+            {
+                Interlocked.Increment(ref _cacheHits);
+                return cached;
+            }
+
+            Interlocked.Increment(ref _cacheMisses);
+            byte[] page = ReadPage(n);
+            _pageCache?.Add(n, page);
             return page;
-        }
-
-        /// <summary>
-        /// Reads multiple pages in parallel when ParallelPageReadsEnabled is true.
-        /// Returns a dictionary of page number -> page data.
-        /// </summary>
-        private Dictionary<long, byte[]> ReadPagesParallel(IEnumerable<long> pageNumbers)
-        {
-            var result = new Dictionary<long, byte[]>();
-            var pages = pageNumbers.ToList();
-
-            if (!ParallelPageReadsEnabled || pages.Count <= 1)
-            {
-                // Fall back to sequential reads
-                foreach (long pageNum in pages)
-                {
-                    result[pageNum] = ReadPageCached(pageNum);
-                }
-                return result;
-            }
-
-            // Parallel read with thread-safe dictionary
-            var syncResult = new System.Collections.Concurrent.ConcurrentDictionary<long, byte[]>();
-
-            System.Threading.Tasks.Parallel.ForEach(pages, pageNum =>
-            {
-                syncResult[pageNum] = ReadPageCached(pageNum);
-            });
-
-            foreach (var kvp in syncResult)
-            {
-                result[kvp.Key] = kvp.Value;
-            }
-
-            return result;
         }
 
         // ── Column / table metadata ───────────────────────────────────────
@@ -421,6 +400,18 @@ namespace JetDatabaseReader
             public List<ColumnInfo> Columns = new List<ColumnInfo>();
             public long RowCount;  // num_rows from TDEF page offset 16
             public bool HasDeletedColumns;  // true if ColNum sequence has gaps
+        }
+
+        // Result type for the internal LVAL chain reader.
+        private sealed class LvalChainResult
+        {
+            public byte[] Data { get; }
+            public string Error { get; }
+
+            private LvalChainResult(byte[] data, string error) { Data = data; Error = error; }
+
+            public static LvalChainResult Success(byte[] data) => new LvalChainResult(data, null);
+            public static LvalChainResult Failure(string error) => new LvalChainResult(null, error);
         }
 
         // ── TDEF reading ──────────────────────────────────────────────────
@@ -559,86 +550,91 @@ namespace JetDatabaseReader
         {
             if (_catalogCache != null) return _catalogCache;
 
-            var diag = new System.Text.StringBuilder();
-            diag.AppendLine($"JET: {(_jet4 ? "Jet4/ACE" : "Jet3")}  PageSize: {_pgSz}  TotalPages: {_fs.Length / _pgSz}");
-
-            // MSysObjects TDEF is hard-coded at page 2 by the Jet engine
-            TableDef msys = ReadTableDef(2);
-            if (msys == null)
+            lock (_catalogLock)
             {
-                diag.AppendLine("ERROR: Page 2 is not a valid TDEF page (null returned).");
-                LastDiagnostics = diag.ToString();
-                _catalogCache = new List<CatalogEntry>();
-                return _catalogCache;
-            }
+                if (_catalogCache != null) return _catalogCache;
 
-            diag.AppendLine($"MSysObjects cols ({msys.Columns.Count}): " +
-                string.Join(", ", msys.Columns.ConvertAll(c => $"{c.Name}[0x{c.Type:X2}]")));
+                var diag = new System.Text.StringBuilder();
+                diag.AppendLine($"JET: {(_jet4 ? "Jet4/ACE" : "Jet3")}  PageSize: {_pgSz}  TotalPages: {_fs.Length / _pgSz}");
 
-            // Case-insensitive column lookup — column names vary slightly across Access versions
-            int idxId    = msys.Columns.FindIndex(c => string.Equals(c.Name, "Id",    StringComparison.OrdinalIgnoreCase));
-            int idxName  = msys.Columns.FindIndex(c => string.Equals(c.Name, "Name",  StringComparison.OrdinalIgnoreCase));
-            int idxType  = msys.Columns.FindIndex(c => string.Equals(c.Name, "Type",  StringComparison.OrdinalIgnoreCase));
-            int idxFlags = msys.Columns.FindIndex(c => string.Equals(c.Name, "Flags", StringComparison.OrdinalIgnoreCase));
-
-            if (idxName < 0 || idxType < 0)
-            {
-                diag.AppendLine("ERROR: Required catalog columns not found. Column name mismatch?");
-                LastDiagnostics = diag.ToString();
-                _catalogCache = new List<CatalogEntry>();
-                return _catalogCache;
-            }
-
-            var result    = new List<CatalogEntry>();
-            long totPages = _fs.Length / _pgSz;
-            int  catPages = 0;
-            int  allRows  = 0;
-
-            for (long p = 3; p < totPages; p++)
-            {
-                byte[] page = ReadPageCached(p);
-                if (page[0] != 0x01) continue;             // data pages only
-                if (Ri32(page, _dpTDefOff) != 2) continue; // must belong to MSysObjects
-                catPages++;
-
-                foreach (List<string> row in EnumerateRows(page, msys))
+                // MSysObjects TDEF is hard-coded at page 2 by the Jet engine
+                TableDef msys = ReadTableDef(2);
+                if (msys == null)
                 {
-                    allRows++;
-                    string typeStr  = SafeGet(row, idxType);
-                    string nameStr  = SafeGet(row, idxName);
-                    string flagsStr = SafeGet(row, idxFlags);
-
-                    if (!int.TryParse(typeStr, out int objType) || objType != OBJ_TABLE)
-                        continue;
-
-                    long.TryParse(flagsStr, out long flagsLong);
-                    if (((uint)flagsLong & SYSTABLE_MASK) != 0)
-                        continue;
-
-                    if (string.IsNullOrEmpty(nameStr)) continue;
-
-                    long tdefPage = 0;
-                    if (idxId >= 0)
-                    {
-                        long.TryParse(SafeGet(row, idxId), out long id);
-                        tdefPage = id & 0x00FFFFFFL;
-                    }
-
-                    if (tdefPage > 0)
-                        result.Add(new CatalogEntry { Name = nameStr, TDefPage = tdefPage });
+                    diag.AppendLine("ERROR: Page 2 is not a valid TDEF page (null returned).");
+                    LastDiagnostics = diag.ToString();
+                    _catalogCache = new List<CatalogEntry>();
+                    return _catalogCache;
                 }
-            }
 
-            diag.AppendLine($"Catalog pages: {catPages}  Total rows scanned: {allRows}  User tables: {result.Count}");
-            if (DiagnosticsEnabled)
-            {
-                foreach (var e in result)
-                    diag.AppendLine($"  [{e.Name}] TDEF page {e.TDefPage}");
-            }
+                diag.AppendLine($"MSysObjects cols ({msys.Columns.Count}): " +
+                    string.Join(", ", msys.Columns.ConvertAll(c => $"{c.Name}[0x{c.Type:X2}]")));
 
-            LastDiagnostics = diag.ToString();
-            _catalogCache = result;
-            return _catalogCache;
+                // Case-insensitive column lookup — column names vary slightly across Access versions
+                int idxId    = msys.Columns.FindIndex(c => string.Equals(c.Name, "Id",    StringComparison.OrdinalIgnoreCase));
+                int idxName  = msys.Columns.FindIndex(c => string.Equals(c.Name, "Name",  StringComparison.OrdinalIgnoreCase));
+                int idxType  = msys.Columns.FindIndex(c => string.Equals(c.Name, "Type",  StringComparison.OrdinalIgnoreCase));
+                int idxFlags = msys.Columns.FindIndex(c => string.Equals(c.Name, "Flags", StringComparison.OrdinalIgnoreCase));
+
+                if (idxName < 0 || idxType < 0)
+                {
+                    diag.AppendLine("ERROR: Required catalog columns not found. Column name mismatch?");
+                    LastDiagnostics = diag.ToString();
+                    _catalogCache = new List<CatalogEntry>();
+                    return _catalogCache;
+                }
+
+                var result    = new List<CatalogEntry>();
+                long totPages = _fs.Length / _pgSz;
+                int  catPages = 0;
+                int  allRows  = 0;
+
+                for (long p = 3; p < totPages; p++)
+                {
+                    byte[] page = ReadPageCached(p);
+                    if (page[0] != 0x01) continue;             // data pages only
+                    if (Ri32(page, _dpTDefOff) != 2) continue; // must belong to MSysObjects
+                    catPages++;
+
+                    foreach (List<string> row in EnumerateRows(page, msys))
+                    {
+                        allRows++;
+                        string typeStr  = SafeGet(row, idxType);
+                        string nameStr  = SafeGet(row, idxName);
+                        string flagsStr = SafeGet(row, idxFlags);
+
+                        if (!int.TryParse(typeStr, out int objType) || objType != OBJ_TABLE)
+                            continue;
+
+                        long.TryParse(flagsStr, out long flagsLong);
+                        if (((uint)flagsLong & SYSTABLE_MASK) != 0)
+                            continue;
+
+                        if (string.IsNullOrEmpty(nameStr)) continue;
+
+                        long tdefPage = 0;
+                        if (idxId >= 0)
+                        {
+                            long.TryParse(SafeGet(row, idxId), out long id);
+                            tdefPage = id & 0x00FFFFFFL;
+                        }
+
+                        if (tdefPage > 0)
+                            result.Add(new CatalogEntry { Name = nameStr, TDefPage = tdefPage });
+                    }
+                }
+
+                diag.AppendLine($"Catalog pages: {catPages}  Total rows scanned: {allRows}  User tables: {result.Count}");
+                if (DiagnosticsEnabled)
+                {
+                    foreach (var e in result)
+                        diag.AppendLine($"  [{e.Name}] TDEF page {e.TDefPage}");
+                }
+
+                LastDiagnostics = diag.ToString();
+                _catalogCache = result;
+                return _catalogCache;
+            }
         }
 
         private static string SafeGet(List<string> row, int idx) =>
@@ -657,12 +653,18 @@ namespace JetDatabaseReader
         /// Returns the column headers and up to <paramref name="maxRows"/> rows
         /// from the first user table, plus the table name and total table count.
         /// </summary>
-        public (List<string> Headers, List<List<string>> Rows, string TableName, int TableCount)
-            ReadFirstTable(int maxRows = 100)
+        public FirstTableResult ReadFirstTable(int maxRows = 100)
         {
-            var empty = (new List<string> { "Info" },
-                         new List<List<string>> { new List<string> { "No user tables found" } },
-                         string.Empty, 0);
+            ThrowIfDisposed();
+
+            var empty = new FirstTableResult
+            {
+                Headers    = new List<string> { "Info" },
+                Rows       = new List<List<string>> { new List<string> { "No user tables found" } },
+                Schema     = new List<TableColumn>(),
+                TableName  = string.Empty,
+                TableCount = 0
+            };
 
             List<CatalogEntry> tables = GetUserTables();
             if (tables.Count == 0) return empty;
@@ -670,9 +672,14 @@ namespace JetDatabaseReader
             CatalogEntry entry = tables[0];
             TableDef td = ReadTableDef(entry.TDefPage);
             if (td == null || td.Columns.Count == 0)
-                return (new List<string> { "Info" },
-                        new List<List<string>> { new List<string> { $"Cannot read TDEF for '{entry.Name}'" } },
-                        entry.Name, tables.Count);
+                return new FirstTableResult
+                {
+                    Headers    = new List<string> { "Info" },
+                    Rows       = new List<List<string>> { new List<string> { $"Cannot read TDEF for '{entry.Name}'" } },
+                    Schema     = new List<TableColumn>(),
+                    TableName  = entry.Name,
+                    TableCount = tables.Count
+                };
 
             var headers = td.Columns.Select(c => c.Name).ToList();
             var rows    = new List<List<string>>();
@@ -691,12 +698,20 @@ namespace JetDatabaseReader
                 }
             }
 
-            return (headers, rows, entry.Name, tables.Count);
+            return new FirstTableResult
+            {
+                Headers    = headers,
+                Rows       = rows,
+                Schema     = new List<TableColumn>(),
+                TableName  = entry.Name,
+                TableCount = tables.Count
+            };
         }
 
         /// <summary>Returns the names of all user tables in the database.</summary>
         public List<string> ListTables()
         {
+            ThrowIfDisposed();
             return GetUserTables().ConvertAll(e => e.Name);
         }
 
@@ -704,14 +719,20 @@ namespace JetDatabaseReader
         /// Returns name, stored row-count, and column-count for every user table.
         /// Calling this instead of <see cref="ListTables"/> avoids a duplicate catalog scan.
         /// </summary>
-        public List<(string Name, long RowCount, int ColumnCount)> GetTableStats()
+        public List<TableStat> GetTableStats()
         {
+            ThrowIfDisposed();
             var entries = GetUserTables();
-            var result  = new List<(string, long, int)>(entries.Count);
+            var result  = new List<TableStat>(entries.Count);
             foreach (var e in entries)
             {
                 TableDef td = ReadTableDef(e.TDefPage);
-                result.Add((e.Name, td?.RowCount ?? 0L, td?.Columns.Count ?? 0));
+                result.Add(new TableStat
+                {
+                    Name        = e.Name,
+                    RowCount    = td?.RowCount ?? 0L,
+                    ColumnCount = td?.Columns.Count ?? 0
+                });
             }
             return result;
         }
@@ -722,15 +743,16 @@ namespace JetDatabaseReader
         /// </summary>
         public DataTable GetTablesAsDataTable()
         {
+            ThrowIfDisposed();
             var dt = new DataTable("Tables");
             dt.Columns.Add("TableName", typeof(string));
             dt.Columns.Add("RowCount", typeof(long));
             dt.Columns.Add("ColumnCount", typeof(int));
 
             var stats = GetTableStats();
-            foreach (var (name, rowCount, colCount) in stats)
+            foreach (TableStat s in stats)
             {
-                dt.Rows.Add(name, rowCount, colCount);
+                dt.Rows.Add(s.Name, s.RowCount, s.ColumnCount);
             }
 
             return dt;
@@ -743,6 +765,8 @@ namespace JetDatabaseReader
         /// </summary>
         public long GetRealRowCount(string tableName)
         {
+            ThrowIfDisposed();
+            Guard.NotNullOrEmpty(tableName, nameof(tableName));
             CatalogEntry entry = GetCatalogEntry(tableName);
             if (entry == null) return 0;
 
@@ -775,6 +799,8 @@ namespace JetDatabaseReader
         /// </summary>
         public TableResult ReadTable(string tableName, int maxRows)
         {
+            ThrowIfDisposed();
+            Guard.NotNullOrEmpty(tableName, nameof(tableName));
             CatalogEntry entry = GetCatalogEntry(tableName);
 
             if (entry == null)
@@ -798,8 +824,8 @@ namespace JetDatabaseReader
             var schema  = td.Columns.ConvertAll(c => new TableColumn
             {
                 Name     = c.Name,
-                TypeName = TypeCodeToName(c.Type),
-                SizeDesc = SizeDescForColumn(c)
+                Type     = TypeCodeToClrType(c.Type),
+                Size     = SizeForColumn(c)
             });
             var rows  = new List<List<string>>();
             long total = _fs.Length / _pgSz;
@@ -817,7 +843,7 @@ namespace JetDatabaseReader
                 }
             }
 
-            return new TableResult { Headers = headers, Rows = rows, Schema = schema };
+            return new TableResult { Headers = headers, Rows = rows, Schema = schema, TableName = tableName };
         }
 
         private static string TypeCodeToName(byte t)
@@ -842,27 +868,30 @@ namespace JetDatabaseReader
             }
         }
 
-        private static string SizeDescForColumn(ColumnInfo col)
+        private static ColumnSize SizeForColumn(ColumnInfo col)
         {
             switch (col.Type)
             {
-                case T_BOOL:     return "1 bit";
-                case T_BYTE:     return "1 byte";
-                case T_INT:      return "2 bytes";
-                case T_LONG:     return "4 bytes";
-                case T_MONEY:    return "8 bytes";
-                case T_FLOAT:    return "4 bytes";
-                case T_DOUBLE:   return "8 bytes";
-                case T_DATETIME: return "8 bytes";
-                case T_GUID:     return "16 bytes";
-                case T_NUMERIC:  return "17 bytes";
-                case T_TEXT:     return col.Size > 0 ? $"{col.Size / 2} chars" : "255 chars";
-                case T_BINARY:   return col.Size > 0 ? $"{col.Size} bytes" : "variable";
+                case T_BOOL:     return ColumnSize.FromBits(1);
+                case T_BYTE:     return ColumnSize.FromBytes(1);
+                case T_INT:      return ColumnSize.FromBytes(2);
+                case T_LONG:     return ColumnSize.FromBytes(4);
+                case T_MONEY:    return ColumnSize.FromBytes(8);
+                case T_FLOAT:    return ColumnSize.FromBytes(4);
+                case T_DOUBLE:   return ColumnSize.FromBytes(8);
+                case T_DATETIME: return ColumnSize.FromBytes(8);
+                case T_GUID:     return ColumnSize.FromBytes(16);
+                case T_NUMERIC:  return ColumnSize.FromBytes(17);
+                case T_TEXT:     return ColumnSize.FromChars(col.Size > 0 ? col.Size / 2 : 255);
+                case T_BINARY:   return col.Size > 0 ? ColumnSize.FromBytes(col.Size) : ColumnSize.Variable;
                 case T_MEMO:
-                case T_OLE:      return "LVAL";
-                default:         return col.Size > 0 ? $"{col.Size} bytes" : "variable";
+                case T_OLE:      return ColumnSize.Lval;
+                default:         return col.Size > 0 ? ColumnSize.FromBytes(col.Size) : ColumnSize.Variable;
             }
         }
+
+        // Used by ColumnMetadata.SizeDescription which keeps a plain string.
+        private static string SizeDescForColumn(ColumnInfo col) => SizeForColumn(col).ToString();
 
         /// <summary>
         /// Yields rows from <paramref name="tableName"/> as properly typed object arrays without collecting them all in memory.
@@ -873,6 +902,13 @@ namespace JetDatabaseReader
         /// <param name="tableName">Table name (case-insensitive).</param>
         /// <param name="progress">Optional progress reporter — receives row count after each page.</param>
         public IEnumerable<object[]> StreamRows(string tableName, IProgress<int> progress = null)
+        {
+            ThrowIfDisposed();
+            Guard.NotNullOrEmpty(tableName, nameof(tableName));
+            return StreamRowsCore(tableName, progress);
+        }
+
+        private IEnumerable<object[]> StreamRowsCore(string tableName, IProgress<int> progress)
         {
             CatalogEntry entry = GetCatalogEntry(tableName);
             if (entry == null) yield break;
@@ -912,6 +948,13 @@ namespace JetDatabaseReader
         /// <param name="progress">Optional progress reporter — receives row count after each page.</param>
         public IEnumerable<string[]> StreamRowsAsStrings(string tableName, IProgress<int> progress = null)
         {
+            ThrowIfDisposed();
+            Guard.NotNullOrEmpty(tableName, nameof(tableName));
+            return StreamRowsAsStringsCore(tableName, progress);
+        }
+
+        private IEnumerable<string[]> StreamRowsAsStringsCore(string tableName, IProgress<int> progress)
+        {
             CatalogEntry entry = GetCatalogEntry(tableName);
             if (entry == null) yield break;
 
@@ -944,6 +987,7 @@ namespace JetDatabaseReader
         /// <param name="progress">Optional progress reporter — receives row count after each page.</param>
         public DataTable ReadTableAsStringDataTable(string tableName = null, IProgress<int> progress = null)
         {
+            ThrowIfDisposed();
             // If no table name specified, use the first table
             if (string.IsNullOrEmpty(tableName))
             {
@@ -1258,24 +1302,22 @@ namespace JetDatabaseReader
                 int rowSize = rowEnd - rowStart + 1;
                 if (rowSize < _numColsFldSz) continue;
 
-                var rowBytes = new byte[rowSize];
-                Array.Copy(page, rowStart, rowBytes, 0, rowSize);
-
-                List<string> values = CrackRow(rowBytes, td);
+                // Pass the page buffer directly with absolute row bounds — no per-row copy
+                List<string> values = CrackRow(page, rowStart, rowSize, td);
                 if (values != null) yield return values;
             }
         }
 
         // ── Row decoding ──────────────────────────────────────────────────
 
-        /// <summary>Decodes a single row byte array into string values per column.</summary>
-        private List<string> CrackRow(byte[] row, TableDef td)
+        /// <summary>Decodes a single row's bytes (within <paramref name="page"/>) into string values per column.</summary>
+        private List<string> CrackRow(byte[] page, int rowStart, int rowSize, TableDef td)
         {
-            if (row.Length < _numColsFldSz) return null;
+            if (rowSize < _numColsFldSz) return null;
 
             // Number of columns stored in THIS row (may be less than td.Columns.Count
             // if columns were added after this row was written)
-            int numCols = _jet4 ? Ru16(row, 0) : row[0];
+            int numCols = _jet4 ? Ru16(page, rowStart) : page[rowStart];
             if (numCols == 0) return null;
 
             // Check for deleted-column schema mismatch
@@ -1290,26 +1332,26 @@ namespace JetDatabaseReader
             }
 
             int nullMaskSz  = (numCols + 7) / 8;
-            int nullMaskPos = row.Length - nullMaskSz;
+            int nullMaskPos = rowSize - nullMaskSz;  // relative to rowStart
             if (nullMaskPos < _numColsFldSz) return null;
 
             // ── Tail section layout (high→low addresses, reading from end) ──
             //  Jet4: [null_mask][var_len(2)][var_table(varLen*2)][eod(2)]
             //  Jet3: [null_mask][var_len(1)][jump_table(n*1)][var_table(varLen*1)][eod(1)]
 
-            int varLenPos = nullMaskPos - _varLenFldSz;
+            int varLenPos = nullMaskPos - _varLenFldSz;  // relative
             if (varLenPos < _numColsFldSz) return null;
 
-            int varLen = _jet4 ? Ru16(row, varLenPos) : row[varLenPos];
+            int varLen = _jet4 ? Ru16(page, rowStart + varLenPos) : page[rowStart + varLenPos];
 
             // Jet3 jump table: floor(rowSize / 256) entries of 1 byte each
-            int jumpSz = _jet4 ? 0 : (row.Length / 256);
+            int jumpSz = _jet4 ? 0 : (rowSize / 256);
 
-            int varTableStart = varLenPos - jumpSz - varLen * _varEntrySz;
-            int eodPos        = varTableStart - _eodFldSz;
+            int varTableStart = varLenPos - jumpSz - varLen * _varEntrySz;  // relative
+            int eodPos        = varTableStart - _eodFldSz;                  // relative
             if (eodPos < _numColsFldSz) return null;
 
-            int eod = _jet4 ? Ru16(row, eodPos) : row[eodPos];
+            int eod = _jet4 ? Ru16(page, rowStart + eodPos) : page[rowStart + eodPos];
 
             // ── Decode each column ────────────────────────────────────────
             var result = new List<string>(td.Columns.Count);
@@ -1324,10 +1366,10 @@ namespace JetDatabaseReader
                 bool nullBit = false;
                 if (col.ColNum < numCols)
                 {
-                    int mByte = nullMaskPos + (col.ColNum / 8);
+                    int mByte = nullMaskPos + (col.ColNum / 8);  // relative
                     int mBit  = col.ColNum % 8;
-                    if (mByte < row.Length)
-                        nullBit = (row[mByte] & (1 << mBit)) != 0;
+                    if (mByte < rowSize)
+                        nullBit = (page[rowStart + mByte] & (1 << mBit)) != 0;
                 }
 
                 // BOOL: null_mask bit IS the value; no bytes stored in the row.
@@ -1349,11 +1391,11 @@ namespace JetDatabaseReader
 
                 if (col.IsFixed)
                 {
-                    int start = _numColsFldSz + col.FixedOff;
+                    int start = _numColsFldSz + col.FixedOff;  // relative
                     int sz    = FixedSize(col.Type, col.Size);
-                    if (sz == 0 || start + sz > row.Length)
+                    if (sz == 0 || start + sz > rowSize)
                     { result.Add(string.Empty); continue; }
-                    result.Add(ReadFixed(row, start, col, sz));
+                    result.Add(ReadFixed(page, rowStart + start, col, sz));
                 }
                 else
                 {
@@ -1363,18 +1405,18 @@ namespace JetDatabaseReader
                     if (col.VarIdx >= varLen)
                     { result.Add(string.Empty); continue; }
 
-                    int entryPos = varTableStart + (varLen - 1 - col.VarIdx) * _varEntrySz;
-                    if (entryPos < 0 || entryPos + _varEntrySz > row.Length)
+                    int entryPos = varTableStart + (varLen - 1 - col.VarIdx) * _varEntrySz;  // relative
+                    if (entryPos < 0 || entryPos + _varEntrySz > rowSize)
                     { result.Add(string.Empty); continue; }
 
-                    int varOff = _jet4 ? Ru16(row, entryPos) : row[entryPos];
+                    int varOff = _jet4 ? Ru16(page, rowStart + entryPos) : page[rowStart + entryPos];
 
                     // End of this variable column's data
                     int varEnd;
                     if (col.VarIdx + 1 < varLen)
                     {
-                        int nextEntry = varTableStart + (varLen - 2 - col.VarIdx) * _varEntrySz;
-                        varEnd = (_jet4 ? Ru16(row, nextEntry) : row[nextEntry]);
+                        int nextEntry = varTableStart + (varLen - 2 - col.VarIdx) * _varEntrySz;  // relative
+                        varEnd = (_jet4 ? Ru16(page, rowStart + nextEntry) : page[rowStart + nextEntry]);
                     }
                     else
                     {
@@ -1384,12 +1426,12 @@ namespace JetDatabaseReader
                     // var_table entries are ROW offsets (from row[0]), not data-area offsets.
                     // FixedOff is a data-area offset (requires + _numColsFldSz), but var_table
                     // entries already include the num_cols header bytes.
-                    int dataStart = varOff;
+                    int dataStart = varOff;          // relative to rowStart
                     int dataLen   = varEnd - varOff;
-                    if (dataLen < 0 || dataStart < 0 || dataStart + dataLen > row.Length)
+                    if (dataLen < 0 || dataStart < 0 || dataStart + dataLen > rowSize)
                     { result.Add(string.Empty); continue; }
 
-                    result.Add(ReadVar(row, dataStart, dataLen, col));
+                    result.Add(ReadVar(page, rowStart + dataStart, dataLen, col));
                 }
             }
 
@@ -1446,10 +1488,15 @@ namespace JetDatabaseReader
                         return BitConverter.ToString(row, start, Math.Min(sz, 8));
                 }
             }
-            catch { return string.Empty; }
+            catch (JetLimitationException)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                return string.Empty;
+            }
         }
-
-        // ── Variable-column value reader ──────────────────────────────────
 
         private string ReadVar(byte[] row, int start, int len, ColumnInfo col)
         {
@@ -1473,10 +1520,15 @@ namespace JetDatabaseReader
                         return string.Empty;
                 }
             }
-            catch { return string.Empty; }
+            catch (JetLimitationException)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                return string.Empty;
+            }
         }
-
-        // ── Long-value (MEMO / OLE) decoder ──────────────────────────────
         //
         // MEMO/OLE field header (12 bytes):
         //   [memo_len: 3 bytes][bitmask: 1 byte][lval_dp: 4 bytes][unknown: 4 bytes]
@@ -1531,9 +1583,8 @@ namespace JetDatabaseReader
         /// Reads multi-page LVAL chains (bitmask 0x00). Follows LVAL page links until
         /// the entire memo is reconstructed or maxLen is reached.
         /// LVAL page format (mdbtools): [next_page(4)][data_length(4)][data...]
-        /// Returns (data, errorMessage) — data is null on failure, errorMessage describes the issue.
         /// </summary>
-        private (byte[] data, string error) ReadLvalChain(uint firstLvalDp, int maxLen)
+        private LvalChainResult ReadLvalChain(uint firstLvalDp, int maxLen)
         {
             try
             {
@@ -1548,19 +1599,19 @@ namespace JetDatabaseReader
 
                     int lvalPage = (int)(currentDp >> 8);
                     int lvalRow  = (int)(currentDp & 0xFF);
-                    if (lvalPage <= 0) return (null, $"invalid page {lvalPage}");
+                    if (lvalPage <= 0) return LvalChainResult.Failure($"invalid page {lvalPage}");
 
                     byte[] page = ReadPageCached(lvalPage);
-                    if (page[0] != 0x01) return (null, $"page {lvalPage} not data page");
+                    if (page[0] != 0x01) return LvalChainResult.Failure($"page {lvalPage} not data page");
 
                     int numRows = Ru16(page, _dpNumRows);
-                    if (lvalRow >= numRows) return (null, $"row {lvalRow} >= numRows {numRows}");
+                    if (lvalRow >= numRows) return LvalChainResult.Failure($"row {lvalRow} >= numRows {numRows}");
 
                     int rawOff = Ru16(page, _dpRowsStart + lvalRow * 2);
-                    if ((rawOff & 0xC000) != 0) return (null, $"deleted/overflow row");
+                    if ((rawOff & 0xC000) != 0) return LvalChainResult.Failure("deleted/overflow row");
 
                     int rowStart = rawOff & 0x1FFF;
-                    if (rowStart == 0 || rowStart >= _pgSz) return (null, $"invalid rowStart {rowStart}");
+                    if (rowStart == 0 || rowStart >= _pgSz) return LvalChainResult.Failure($"invalid rowStart {rowStart}");
 
                     int rowEnd = _pgSz - 1;
                     for (int r = 0; r < numRows; r++)
@@ -1570,7 +1621,7 @@ namespace JetDatabaseReader
                     }
 
                     int rowSize = rowEnd - rowStart + 1;
-                    if (rowSize < 8) return (null, $"rowSize {rowSize} < 8");
+                    if (rowSize < 8) return LvalChainResult.Failure($"rowSize {rowSize} < 8");
 
                     // LVAL chain format: [next_dp(4)][data_len(4)][data...]
                     currentDp = Ru32(page, rowStart);
@@ -1587,8 +1638,8 @@ namespace JetDatabaseReader
                     }
                 }
 
-                if (chunks.Count == 0) return (null, "no chunks read");
-                if (chunks.Count == 1) return (chunks[0], null);
+                if (chunks.Count == 0) return LvalChainResult.Failure("no chunks read");
+                if (chunks.Count == 1) return LvalChainResult.Success(chunks[0]);
 
                 // Concatenate all chunks
                 int finalLen = Math.Min(totalLen, maxLen);
@@ -1601,9 +1652,9 @@ namespace JetDatabaseReader
                     pos += copyLen;
                     if (pos >= finalLen) break;
                 }
-                return (result, null);
+                return LvalChainResult.Success(result);
             }
-            catch (Exception ex) { return (null, ex.Message); }
+            catch (Exception ex) { return LvalChainResult.Failure(ex.Message); }
         }
 
         /// <summary>
@@ -1715,17 +1766,17 @@ namespace JetDatabaseReader
 
             // Multi-page LVAL (0x00) — follow the chain
             uint chainDp = Ru32(row, start + 4);
-            var (chainData, chainError) = ReadLvalChain(chainDp, memoLen);
+            LvalChainResult chain = ReadLvalChain(chainDp, memoLen);
 
-            if (chainData != null)
+            if (chain.Data != null)
             {
-                if (isOle) return TryDecodeOleObject(chainData, 0, chainData.Length) ?? "(OLE)";
+                if (isOle) return TryDecodeOleObject(chain.Data, 0, chain.Data.Length) ?? "(OLE)";
 
-                return _jet4 ? DecodeJet4Text(chainData, 0, chainData.Length)
-                             : _ansiEncoding.GetString(chainData);
+                return _jet4 ? DecodeJet4Text(chain.Data, 0, chain.Data.Length)
+                             : _ansiEncoding.GetString(chain.Data);
             }
 
-            return isOle ? $"(OLE chain error: {chainError})" : $"(memo chain error: {chainError})";
+            return isOle ? $"(OLE chain error: {chain.Error})" : $"(memo chain error: {chain.Error})";
         }
 
         // ── Jet4 text decoding ────────────────────────────────────────────
@@ -1785,63 +1836,32 @@ namespace JetDatabaseReader
         /// <summary>
         /// Reads a Jet NUMERIC (17 bytes):
         ///   [precision(1)][scale(1)][sign(1)][pad(1)][96-bit LE integer: lo(4)+mid(4)+hi(4)]
-        /// Throws JetLimitationException if the value would lose precision when converted to decimal.
+        /// Uses the <see cref="decimal(int,int,int,bool,byte)"/> constructor which accepts any
+        /// 96-bit integer directly — no manual multiply-chain needed.
         /// </summary>
         private static string ReadNumeric(byte[] b, int start)
         {
             if (start + 16 > b.Length) return string.Empty;
 
-            byte precision = b[start];
             byte scale = b[start + 1];
-            bool neg = (b[start + 2] != 0);
-            uint lo = Ru32(b, start + 4);
-            uint mid = Ru32(b, start + 8);
-            uint hi = Ru32(b, start + 12);
+            bool neg   = (b[start + 2] != 0);
+            uint lo    = Ru32(b, start + 4);
+            uint mid   = Ru32(b, start + 8);
+            uint hi    = Ru32(b, start + 12);
 
-            // Check if the 96-bit value would overflow decimal (which is 96 bits but has max value constraints)
-            // decimal.MaxValue = 79,228,162,514,264,337,593,543,950,335
-            // This is approximately 0x0000_0000_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF
-
-            // If hi > 0 and has bits set beyond what decimal can hold, we'll overflow
-            // decimal can hold max ~7.9e28, which fits in 96 bits but not all 96-bit values
-            if (hi > 0xFFFFFFFF || (hi == 0xFFFFFFFF && mid == 0xFFFFFFFF && lo > 0xFFFFFFFF))
-            {
-                // Try to detect if this would actually overflow
-                try
-                {
-                    decimal val = (decimal)lo + (decimal)mid * 4294967296m + (decimal)hi * 18446744073709551616m;
-
-                    // Apply scale
-                    for (int s = 0; s < scale; s++)
-                    {
-                        val /= 10m;
-                    }
-
-                    return (neg ? -val : val).ToString("G");
-                }
-                catch (OverflowException)
-                {
-                    throw new JetLimitationException(
-                        $"T_NUMERIC value exceeds decimal precision (hi=0x{hi:X8}, mid=0x{mid:X8}, lo=0x{lo:X8}, scale={scale}). " +
-                        $"This 96-bit integer is too large for .NET decimal type.");
-                }
-            }
+            // decimal(int lo, int mid, int hi, bool isNegative, byte scale) requires scale ≤ 28
+            if (scale > 28)
+                throw new JetLimitationException(
+                    $"T_NUMERIC scale {scale} exceeds the .NET decimal maximum of 28.");
 
             try
             {
-                decimal val = (decimal)lo + (decimal)mid * 4294967296m + (decimal)hi * 18446744073709551616m;
-
-                for (int s = 0; s < scale; s++)
-                {
-                    val /= 10m;
-                }
-
-                return (neg ? -val : val).ToString("G");
+                return new decimal((int)lo, (int)mid, (int)hi, neg, scale).ToString("G");
             }
             catch (OverflowException ex)
             {
                 throw new JetLimitationException(
-                    $"T_NUMERIC value overflow (precision={precision}, scale={scale})", ex);
+                    $"T_NUMERIC value overflow (hi=0x{hi:X8}, mid=0x{mid:X8}, lo=0x{lo:X8}, scale={scale})", ex);
             }
         }
 

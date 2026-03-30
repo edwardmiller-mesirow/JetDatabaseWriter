@@ -7,7 +7,7 @@
 
 Pure-managed .NET library for reading Microsoft Access JET databases — no OleDB, ODBC, or ACE/Jet driver installation required.
 
-> **v2.0** introduced typed DataTables and typed streaming by default. See [CHANGELOG.md](CHANGELOG.md) and the [migration guide](#migration-from-v1) for breaking changes.
+> **v2.0** introduced typed DataTables and typed streaming by default. **v2.1** adds structured schema types (`ColumnSize`, `TableStat`, `FirstTableResult`) and promotes CLR types for column metadata. See [CHANGELOG.md](CHANGELOG.md) and the [migration guide](#migration-from-v1) for breaking changes.
 
 ---
 
@@ -97,9 +97,14 @@ DataTable dt = reader.ReadTableAsStringDataTable("Products");
 ### Table preview with schema
 
 ```csharp
-TablePreviewResult preview = reader.ReadTable("Products", maxRows: 20);
-foreach (TablePreviewColumn col in preview.Schema)
-    Console.WriteLine($"{col.Name}: {col.TypeName} ({col.SizeDesc})");
+TableResult preview = reader.ReadTable("Products", maxRows: 20);
+foreach (TableColumn col in preview.Schema)
+{
+    Type   clrType = col.Type;            // e.g. typeof(int), typeof(string)
+    string display = col.Size.ToString(); // e.g. "4 bytes", "255 chars", "LVAL"
+    bool   isLval  = col.Size.Unit == ColumnSizeUnit.Lval;
+    Console.WriteLine($"{col.Name}: {clrType.Name} ({col.Size})");
+}
 ```
 
 ---
@@ -182,6 +187,14 @@ Dictionary<string, DataTable> allStr = reader.ReadAllTablesAsStrings();
 foreach (ColumnMetadata col in reader.GetColumnMetadata("Orders"))
     Console.WriteLine($"{col.Ordinal}. {col.Name} — {col.TypeName} ({col.ClrType.Name})");
 
+// Table-level stats (single catalog scan)
+foreach (TableStat s in reader.GetTableStats())
+    Console.WriteLine($"{s.Name}: {s.RowCount:N0} rows, {s.ColumnCount} cols");
+
+// First table preview + total table count
+FirstTableResult first = reader.ReadFirstTable();
+Console.WriteLine($"First: {first.TableName} ({first.TableCount} tables total)");
+
 DatabaseStatistics s = reader.GetStatistics();
 Console.WriteLine($"Version:   {s.Version}");
 Console.WriteLine($"Size:      {s.DatabaseSizeBytes / 1024 / 1024} MB");
@@ -246,9 +259,23 @@ var dt = r.ReadTableAsDataTable("Orders");             // v1 — string columns
 var dt = r.ReadTable("Orders");                        // v2 ✅ typed
 var dt = r.ReadTableAsStringDataTable("Orders");       // v2 compat
 
-// Preview
-var t = r.ReadTable("T", maxRows: 10);                 // v1 ❌ — returned a tuple
-TablePreviewResult t = r.ReadTable("T", 10);           // v2 ✅ typed result
+// Preview (v2.0.0 → v2.0.1: type rename)
+TablePreviewResult t = r.ReadTable("T", 10);           // v2.0.0 ❌
+TableResult        t = r.ReadTable("T", 10);           // v2.0.1+ ✅
+
+// Schema properties (v2.0.1 → v2.1.0)
+col.TypeName  // v2.0.1 ❌ — string e.g. "Long Integer"
+col.Type      // v2.1.0 ✅ — System.Type e.g. typeof(int)
+col.SizeDesc  // v2.0.1 ❌ — string e.g. "4 bytes"
+col.Size      // v2.1.0 ✅ — ColumnSize struct (.Value, .Unit, .ToString())
+
+// Table stats (v2.1.0)
+foreach (var (n, r, c) in reader.GetTableStats())       // v2.0 ❌ tuple
+foreach (TableStat s in reader.GetTableStats())         // v2.1 ✅ named type
+
+// First table (v2.1.0)
+TableResult      r = reader.ReadFirstTable();           // v2.0 ❌
+FirstTableResult r = reader.ReadFirstTable();           // v2.1 ✅ + r.TableCount
 
 // Streaming
 foreach (string[] row in r.StreamRows("T"))            // v1

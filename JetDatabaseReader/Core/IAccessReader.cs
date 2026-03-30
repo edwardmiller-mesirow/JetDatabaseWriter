@@ -27,8 +27,7 @@ namespace JetDatabaseReader
         /// Returns the column headers and up to <paramref name="maxRows"/> rows
         /// from the first user table, plus the table name and total table count.
         /// </summary>
-        (List<string> Headers, List<List<string>> Rows, string TableName, int TableCount)
-            ReadFirstTable(int maxRows = 100);
+        FirstTableResult ReadFirstTable(int maxRows = 100);
 
         /// <summary>Returns the names of all user tables in the database.</summary>
         List<string> ListTables();
@@ -37,7 +36,7 @@ namespace JetDatabaseReader
         /// Returns name, stored row-count, and column-count for every user table.
         /// Calling this instead of <see cref="ListTables"/> avoids a duplicate catalog scan.
         /// </summary>
-        List<(string Name, long RowCount, int ColumnCount)> GetTableStats();
+        List<TableStat> GetTableStats();
 
         /// <summary>
         /// Returns table metadata as a DataTable with columns: TableName, RowCount, ColumnCount.

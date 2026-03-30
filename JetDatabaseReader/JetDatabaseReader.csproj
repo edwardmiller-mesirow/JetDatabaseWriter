@@ -4,9 +4,9 @@
     <LangVersion>7.3</LangVersion>
     <Nullable>disable</Nullable>
     <PackageId>JetDatabaseReader</PackageId>
-    <Version>2.0.1</Version>
-    <Authors>Diego Rípera</Authors>
-    <Company>Rípera</Company>
+    <Version>2.1.0</Version>
+    <Authors>Diego Ripera</Authors>
+    <Company>Ripera</Company>
     <Description>Pure-managed reader for Microsoft Access JET databases (.mdb/.accdb). No OleDB, ODBC, or ACE drivers required. v2: typed DataTables and object[] streaming by default.</Description>
     <PackageTags>access;jet;mdb;accdb;database;microsoft-access</PackageTags>
     <PackageProjectUrl>https://github.com/diegoripera/JetDatabaseReader</PackageProjectUrl>

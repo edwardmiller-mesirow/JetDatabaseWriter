@@ -228,11 +228,11 @@ namespace JetDatabaseReader.Tests
         {
             using var reader = TestDatabases.Open(path);
 
-            var (headers, _, tableName, tableCount) = reader.ReadFirstTable();
+            FirstTableResult result = reader.ReadFirstTable();
 
-            headers.Should().NotBeEmpty();
-            tableName.Should().NotBeNullOrWhiteSpace();
-            tableCount.Should().BeGreaterThan(0);
+            result.Headers.Should().NotBeEmpty();
+            result.TableName.Should().NotBeNullOrWhiteSpace();
+            result.TableCount.Should().BeGreaterThan(0);
         }
 
         // ── ReadTable (preview overload) ──────────────────────────────────
